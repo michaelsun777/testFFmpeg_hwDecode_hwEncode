@@ -1,0 +1,55 @@
+{
+	"version": "2.0.0",
+	"options": {
+		"cwd": "${workspaceFolder}/build"
+	},
+	"tasks": [
+		// {
+		//     "type": "cppbuild",                                 //任务类型
+		//     "label": "g++ build active file",                                     //任务名称，与launch.json文件的preLaunchTask参数相同（必须）
+		//     "command": "g++", //执行编译的编译器或脚本的路径
+		//     "args": [
+		//         ".."                                         //args相当于执行   g++ ....cpp -o ....exe
+		//         // "-g",
+		//         // "${file}",
+		//         // "-o",
+		//         // "${fileDirname}/${fileBasenameNoExtension}"
+		//     ],
+		//     "options": {
+		//         "cwd": "${workspaceFolder}/build"        //g++,gdb之类的脚本或者可执行文件的工作目录
+		//     },
+		//     "problemMatcher": [
+		//         "$gcc"
+		//     ],
+		//     "group": {
+		//         "kind": "build",
+		//         "isDefault": true
+		//     },
+		//     "detail": "调试器生成的任务。"
+		// },
+		{
+			"type": "shell", // open the shell 打开终端
+			"label": "cmake",
+			"command": "cmake", // 执行命令 cmake ..
+			"args": [
+				".."
+			]
+		},
+		{
+			"label": "make",
+			"group": "build",
+			"command": "make", // 执行命令make
+			"args": [
+				"-j10"
+			]
+		},
+		{
+			"label": "Build",
+			"dependsOrder": "sequence",
+			"dependsOn": [
+				"cmake",
+				"make"
+			]
+		}
+	]
+}
