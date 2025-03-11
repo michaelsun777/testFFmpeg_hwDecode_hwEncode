@@ -1,3 +1,11 @@
+//#include <stdio.h>
+//#include <string.h>
+// 
+// #include <assert.h>
+// #include <unistd.h>
+
+
+
 extern "C"
 {
 #include <libavcodec/avcodec.h>
@@ -11,6 +19,7 @@ extern "C"
 }
 
 #include <iostream>
+#include <sys/time.h>
 
 static AVBufferRef *hw_device_ctx = NULL;// 硬件设备上下文
 static enum AVPixelFormat hw_pix_fmt;
@@ -27,6 +36,20 @@ AVStream * stream = nullptr;	// 编码后输出流
 
 #define ENCODE_OPEN 1
 int64_t num_frames = 0; // 解码帧数
+int width_en = 0;
+int height_en = 0;
+
+
+
+
+int64_t GetCurrentStamp()
+{
+	struct timeval tv;
+    struct timezone tz;
+    gettimeofday(&tv, &tz);
+	return tv.tv_usec / 1000;
+}
+
 
 
 // 硬件加速初始化
@@ -68,6 +91,7 @@ static int decode_write(AVCodecContext *avctx, AVPacket *packet)
 	int size;
 	int ret = 0;
 
+	int64_t decode_start = GetCurrentStamp();
 	ret = avcodec_send_packet(avctx, packet);
 	if (ret < 0)
 	{
@@ -81,10 +105,17 @@ static int decode_write(AVCodecContext *avctx, AVPacket *packet)
 		{
 			fprintf(stderr, "Can not alloc frame\n");
 			ret = AVERROR(ENOMEM);
-			goto fail;
+			goto failed;
 		}
 
 		ret = avcodec_receive_frame(avctx, frame);
+
+		int64_t decode_end;
+		{			
+			decode_end = GetCurrentStamp();
+			printf("decode spends %ld us\n", decode_start - decode_end);
+		}
+		
 		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
 		{
 			av_frame_free(&frame);
@@ -94,8 +125,10 @@ static int decode_write(AVCodecContext *avctx, AVPacket *packet)
 		else if (ret < 0)
 		{
 			fprintf(stderr, "Error while decoding\n");
-			goto fail;
+			goto failed;
 		}
+
+		
 
 		// if (frame->format == hw_pix_fmt)
 		// {
@@ -118,6 +151,8 @@ static int decode_write(AVCodecContext *avctx, AVPacket *packet)
 			//tmp_frame->pts = num_frames * 3000;
 			//num_frames++;
 
+
+			int64_t now_start = GetCurrentStamp();
 			// 发送帧到编码器
 			ret = avcodec_send_frame(codec_ctx_en, tmp_frame);
 			if (ret < 0)
@@ -135,7 +170,10 @@ static int decode_write(AVCodecContext *avctx, AVPacket *packet)
 					av_packet_free(&pkt);
 					ret = 0;
 					break;
-				}	
+				}
+
+				int64_t now_end = GetCurrentStamp();
+				printf("encode spends %ld us\n", now_end - now_start);
 				
 				// 设置数据包的流索引和时间基
 				pkt->stream_index = stream->index;
@@ -184,7 +222,7 @@ static int decode_write(AVCodecContext *avctx, AVPacket *packet)
 		}
         */
 
-	fail:
+	failed:
 		av_frame_free(&frame);
 		av_frame_free(&sw_frame);
 		av_freep(&buffer);
@@ -198,7 +236,7 @@ int main(int argc, char *argv[])
 	int video_stream, ret;
 	AVStream *video = NULL;
 	AVCodecContext *decoder_ctx = NULL;
-	const AVCodec * decoder = NULL;
+	const AVCodec * decoder_codec = NULL;
 	AVPacket packet;
 	enum AVHWDeviceType type;
 	int i;
@@ -227,14 +265,17 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
+	output_filename = argv[3];
+
+	
 	if (avformat_find_stream_info(input_ctx, NULL) < 0)
 	{
 		fprintf(stderr, "Cannot find input stream information.\n");
 		return -1;
 	}
 
-	/* find the video stream information */
-	ret = av_find_best_stream(input_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
+	/* find the video stream information */// 查找视频流信息
+	ret = av_find_best_stream(input_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder_codec, 0);
 	if (ret < 0)
 	{
 		fprintf(stderr, "Cannot find a video stream in the input file\n");
@@ -245,11 +286,11 @@ int main(int argc, char *argv[])
 	// 查找到对应硬件类型解码后的数据格式
 	for (i = 0;; i++)
 	{
-		const AVCodecHWConfig *config = avcodec_get_hw_config(decoder, i);
+		const AVCodecHWConfig *config = avcodec_get_hw_config(decoder_codec, i);
 		if (!config)
 		{
 			fprintf(stderr, "Decoder %s does not support device type %s.\n",
-					decoder->name, av_hwdevice_get_type_name(type));
+				decoder_codec->name, av_hwdevice_get_type_name(type));
 			return -1;
 		}
 		if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
@@ -260,12 +301,16 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (!(decoder_ctx = avcodec_alloc_context3(decoder)))
+	if (!(decoder_ctx = avcodec_alloc_context3(decoder_codec)))
 		return AVERROR(ENOMEM);
 
 	video = input_ctx->streams[video_stream];
 	if (avcodec_parameters_to_context(decoder_ctx, video->codecpar) < 0)
 		return -1;
+	
+	printf("width:%d,height:%d\n",video->codecpar->width,video->codecpar->height);
+	width_en = video->codecpar->width;
+	height_en = video->codecpar->height;
 
 	decoder_ctx->get_format = get_hw_format;
 
@@ -273,7 +318,7 @@ int main(int argc, char *argv[])
 	if (hw_decoder_init(decoder_ctx, type) < 0)
 		return -1;
 
-	if ((ret = avcodec_open2(decoder_ctx, decoder, NULL)) < 0)
+	if ((ret = avcodec_open2(decoder_ctx, decoder_codec, NULL)) < 0)
 	{
 		fprintf(stderr, "Failed to open codec for stream #%u\n", video_stream);
 		return -1;
@@ -295,8 +340,9 @@ int main(int argc, char *argv[])
 		AVHWFramesContext *hw_frames_ctx = (AVHWFramesContext *)hw_frames_ref->data;
 		hw_frames_ctx->format = AV_PIX_FMT_VAAPI;	// 硬件像素格式
 		hw_frames_ctx->sw_format = AV_PIX_FMT_NV12; // 软件像素格式
-		hw_frames_ctx->width = 3840;				// 视频宽度
-		hw_frames_ctx->height = 2160;				// 视频高度
+		//hw_frames_ctx->sw_format = AV_PIX_FMT_VAAPI; // 软件像素格式
+		hw_frames_ctx->width = width_en;				// 视频宽度
+		hw_frames_ctx->height = height_en;				// 视频高度
 		hw_frames_ctx->initial_pool_size = 20;		// 初始帧池大小
 
 		// 3. 查找编码器（使用 hevc_vaapi 编码器）
@@ -315,16 +361,16 @@ int main(int argc, char *argv[])
 
 		// 配置编码器参数
 		codec_ctx_en->hw_frames_ctx = av_buffer_ref(hw_frames_ref); // 绑定硬件帧上下文
-		codec_ctx_en->width = 3840;									// 视频宽度
-		codec_ctx_en->height = 2160;								// 视频高度
+		codec_ctx_en->width = width_en;									// 视频宽度
+		codec_ctx_en->height = height_en;								// 视频高度
 		codec_ctx_en->time_base = av_inv_q(frame_rate);				// 时间基（帧率的倒数）
 		codec_ctx_en->framerate = frame_rate;						// 帧率
 		codec_ctx_en->pix_fmt = AV_PIX_FMT_VAAPI;					// 像素格式
-		codec_ctx_en->bit_rate = 10 * 1024 * 1024;					// 码率（4 Mbps）
-		codec_ctx_en->gop_size = 1;									// GOP 大小（关键帧间隔）
+		codec_ctx_en->bit_rate = 20 * 1024 * 1024;					// 码率（ Mbps）
+		codec_ctx_en->gop_size = 30;									// GOP 大小（关键帧间隔）
 
 		// 打开编码器
-		ret = avcodec_open2(codec_ctx_en, codec_en, nullptr);
+		ret = avcodec_open2(codec_ctx_en, codec_en, nullptr);		
 		if (ret < 0)
 		{
 			throw std::runtime_error("Could not open codec");
