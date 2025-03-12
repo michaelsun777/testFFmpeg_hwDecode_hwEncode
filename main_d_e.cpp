@@ -20,6 +20,11 @@ extern "C"
 
 #include <iostream>
 #include <sys/time.h>
+//#include "cspdlog.h"
+#include <pthread.h>
+
+
+
 
 static AVBufferRef *hw_device_ctx = NULL;// 硬件设备上下文
 static enum AVPixelFormat hw_pix_fmt;
@@ -35,9 +40,14 @@ AVPacket * pkt = nullptr;             // 编码后的数据包
 AVStream * stream = nullptr;	// 编码后输出流
 
 #define ENCODE_OPEN 1
+#define WRITE_NV12  0
+
+
 int64_t num_frames = 0; // 解码帧数
 int width_en = 0;
 int height_en = 0;
+int bit_rate = 4;//M
+int gop_size = 0;//多少帧出一帧关键帧
 
 
 
@@ -47,7 +57,7 @@ int64_t GetCurrentStamp()
 	struct timeval tv;
     struct timezone tz;
     gettimeofday(&tv, &tz);
-	return tv.tv_usec / 1000;
+	return tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
 
@@ -110,10 +120,16 @@ static int decode_write(AVCodecContext *avctx, AVPacket *packet)
 
 		ret = avcodec_receive_frame(avctx, frame);
 
-		int64_t decode_end;
-		{			
+		
+		{
+			int64_t decode_end;			
 			decode_end = GetCurrentStamp();
-			printf("decode spends %ld us\n", decode_start - decode_end);
+			int64_t temp = decode_end - decode_start;
+			if(temp > 50)
+				printf("--------------decode spends %ld us\n", temp);
+			else
+				printf("decode spends %ld us\n", temp);
+
 		}
 		
 		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
@@ -142,7 +158,7 @@ static int decode_write(AVCodecContext *avctx, AVPacket *packet)
 		// }
 		// else
 		//	tmp_frame = frame;
-		tmp_frame = frame;
+		
 
 		
 		if(ENCODE_OPEN)
@@ -151,10 +167,14 @@ static int decode_write(AVCodecContext *avctx, AVPacket *packet)
 			//tmp_frame->pts = num_frames * 3000;
 			//num_frames++;
 
+			// 设置帧的显示时间戳（PTS）
+			frame->pts = num_frames * 6000;
+			num_frames ++;
+
 
 			int64_t now_start = GetCurrentStamp();
 			// 发送帧到编码器
-			ret = avcodec_send_frame(codec_ctx_en, tmp_frame);
+			ret = avcodec_send_frame(codec_ctx_en, frame);
 			if (ret < 0)
 			{
 				throw std::runtime_error("Error sending frame to encoder");
@@ -173,7 +193,12 @@ static int decode_write(AVCodecContext *avctx, AVPacket *packet)
 				}
 
 				int64_t now_end = GetCurrentStamp();
-				printf("encode spends %ld us\n", now_end - now_start);
+
+				int64_t temp = now_end - now_start;
+				if(temp > 50)
+					printf("++++++++++++++++++encode spends %ld us\n", temp);
+				else
+					printf("encode spends %ld us\n", temp);				
 				
 				// 设置数据包的流索引和时间基
 				pkt->stream_index = stream->index;
@@ -192,35 +217,48 @@ static int decode_write(AVCodecContext *avctx, AVPacket *packet)
 
 		}
 
-		
-		
+		if(WRITE_NV12)
+		{
+			if (frame->format == hw_pix_fmt)
+			{
+				/* 将解码后的数据从GPU内存存格式转为CPU内存格式，并完成GPU到CPU内存的拷贝*/
+				if ((ret = av_hwframe_transfer_data(sw_frame, frame, 0)) < 0)
+				{
+					fprintf(stderr, "Error transferring the data to system memory\n");
+					goto failed;
+				}
+				tmp_frame = sw_frame;
+			}
+			else
+				tmp_frame = frame;
 
-		/*
-		// 计算一张YUV图需要的内存 大小
-		size = av_image_get_buffer_size((AVPixelFormat)tmp_frame->format, tmp_frame->width,	tmp_frame->height, 1);
-		// 分配内存
-		buffer = (uint8_t *)av_malloc(size);
-		if (!buffer)
-		{
-			fprintf(stderr, "Can not alloc buffer\n");
-			ret = AVERROR(ENOMEM);
-			goto fail;
+			// 计算一张YUV图需要的内存 大小
+			size = av_image_get_buffer_size((AVPixelFormat)tmp_frame->format, tmp_frame->width, tmp_frame->height, 1);
+			// 分配内存
+			buffer = (uint8_t *)av_malloc(size);
+			if (!buffer)
+			{
+				fprintf(stderr, "Can not alloc buffer\n");
+				ret = AVERROR(ENOMEM);
+				goto failed;
+			}
+			// 将图片数据拷贝的buffer中(按行拷贝)
+			ret = av_image_copy_to_buffer(buffer, size, (const uint8_t *const *)tmp_frame->data, (const int *)tmp_frame->linesize,
+										  (AVPixelFormat)tmp_frame->format, tmp_frame->width, tmp_frame->height, 1);
+			if (ret < 0)
+			{
+				fprintf(stderr, "Can not copy image to buffer\n");
+				goto failed;
+			}
+			// buffer数据dump到文件
+			if ((ret = fwrite(buffer, 1, size, output_file)) < 0)
+			{
+				fprintf(stderr, "Failed to dump raw data.\n");
+				goto failed;
+			}
 		}
-		// 将图片数据拷贝的buffer中(按行拷贝)
-		ret = av_image_copy_to_buffer(buffer, size,	(const uint8_t *const *)tmp_frame->data,(const int *)tmp_frame->linesize, 
-									(AVPixelFormat)tmp_frame->format, tmp_frame->width, tmp_frame->height, 1);
-		if (ret < 0)
-		{
-			fprintf(stderr, "Can not copy image to buffer\n");
-			goto fail;
-		}
-		// buffer数据dump到文件
-		if ((ret = fwrite(buffer, 1, size, output_file)) < 0)
-		{
-			fprintf(stderr, "Failed to dump raw data.\n");
-			goto fail;
-		}
-        */
+		
+        
 
 	failed:
 		av_frame_free(&frame);
@@ -230,13 +268,17 @@ static int decode_write(AVCodecContext *avctx, AVPacket *packet)
 			return ret;
 	}
 }
+
+
+
 int main(int argc, char *argv[])
 {
+	//std::shared_ptr<MYSPDLOG::CSpdlog> splog(MYSPDLOG::GetInstance());
 	AVFormatContext *input_ctx = NULL;
 	int video_stream, ret;
 	AVStream *video = NULL;
 	AVCodecContext *decoder_ctx = NULL;
-	const AVCodec * decoder_codec = NULL;
+	AVCodec * decoder_codec = NULL;
 	AVPacket packet;
 	enum AVHWDeviceType type;
 	int i;
@@ -266,6 +308,10 @@ int main(int argc, char *argv[])
 	}
 
 	output_filename = argv[3];
+	int nTmp = atoi(argv[4]);
+	if(nTmp > 0)
+		bit_rate = nTmp;
+
 
 	
 	if (avformat_find_stream_info(input_ctx, NULL) < 0)
@@ -315,7 +361,7 @@ int main(int argc, char *argv[])
 	decoder_ctx->get_format = get_hw_format;
 
 	// 硬件加速初始化
-	if (hw_decoder_init(decoder_ctx, type) < 0)
+	if (ret = hw_decoder_init(decoder_ctx, type) < 0)
 		return -1;
 
 	if ((ret = avcodec_open2(decoder_ctx, decoder_codec, NULL)) < 0)
@@ -347,6 +393,7 @@ int main(int argc, char *argv[])
 
 		// 3. 查找编码器（使用 hevc_vaapi 编码器）
 		const AVCodec *codec_en = avcodec_find_encoder_by_name("hevc_vaapi");
+		//const AVCodec *codec_en = avcodec_find_encoder_by_name("hevc_nvenc");
 		if (!codec_en)
 		{
 			throw std::runtime_error("Codec vaapi not found");
@@ -366,8 +413,27 @@ int main(int argc, char *argv[])
 		codec_ctx_en->time_base = av_inv_q(frame_rate);				// 时间基（帧率的倒数）
 		codec_ctx_en->framerate = frame_rate;						// 帧率
 		codec_ctx_en->pix_fmt = AV_PIX_FMT_VAAPI;					// 像素格式
-		codec_ctx_en->bit_rate = 20 * 1024 * 1024;					// 码率（ Mbps）
-		codec_ctx_en->gop_size = 30;									// GOP 大小（关键帧间隔）
+		codec_ctx_en->bit_rate = bit_rate * 1024 * 1024;					// 码率（ Mbps）
+		codec_ctx_en->rc_min_rate =  bit_rate * 1024 * 1024;
+		codec_ctx_en->rc_max_rate = bit_rate * 1024 * 1024;
+		codec_ctx_en->bit_rate_tolerance = bit_rate * 1024 * 1024 /2; //允许比特流偏离参考的比特数
+		codec_ctx_en->rc_buffer_size = bit_rate * 2;
+
+
+		//codec_ctx_en->rc_initial_buffer_occupancy = codec_ctx_en->rc_buffer_size * 3 / 4;
+		//codec_ctx_en->rc_buffer_aggressivity = (float)1.0;
+		//codec_ctx_en->rc_initial_cplx = 0.5;
+
+		codec_ctx_en->gop_size = gop_size;									// GOP 大小（关键帧间隔）
+		codec_ctx_en->max_b_frames = 0;
+		
+
+		av_opt_set(codec_ctx_en->priv_data,"nal-hrd", "cbr", 0);
+		av_opt_set(codec_ctx_en->priv_data, "profile", "high", 0);
+
+
+
+		
 
 		// 打开编码器
 		ret = avcodec_open2(codec_ctx_en, codec_en, nullptr);		
@@ -417,8 +483,12 @@ int main(int argc, char *argv[])
 
 //****************************************** */
 
-	/* open the file to dump raw data */
-	output_file = fopen(argv[3], "w+b");
+	if(WRITE_NV12)
+	{
+		/* open the file to dump raw data */
+		output_file = fopen("testout.nv12", "w+b");
+	}
+	
 
 
 	/* actual decoding and dump the raw data */
